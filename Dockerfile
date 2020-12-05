@@ -1,0 +1,14 @@
+FROM golang:1.14-alpine
+
+ENV PROJECT_PATH=/
+ENV PATH=$PATH:$PROJECT_PATH/build
+ENV CGO_ENABLED=0
+
+RUN apk add  make bash
+
+
+RUN mkdir -p $PATH
+COPY . $PROJECT_PATH
+WORKDIR $PROJECT_PATH
+
+RUN make serve
