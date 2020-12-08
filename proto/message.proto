@@ -17,11 +17,12 @@ message RaftMessage {
   string to = 3;
   uint64 term = 4;
   repeated Peer peers = 5;
-  bytes context = 6;
+  bool reject = 6;
 }
 
 message Peer {
   string ip = 1;
+  bool active = 2;
 }
 
 enum RaftState {

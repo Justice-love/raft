@@ -3,7 +3,6 @@ package raft
 import (
 	"eddy.org/raft/proto"
 	"math/rand"
-	"sync"
 	"time"
 )
 
@@ -15,6 +14,8 @@ type Raft interface {
 	Step(message proto.RaftMessage)
 	Receive() chan<- proto.RaftMessage
 }
+
+var None = ""
 
 type Node struct {
 	ip       string
@@ -35,7 +36,8 @@ type Node struct {
 	tickc    chan struct{}
 	recvc    chan *proto.RaftMessage
 	advancec chan *proto.RaftMessage
-	lock     *sync.Mutex
+
+	tracker *progressTracker
 }
 
 func (n *Node) Advance() {
@@ -53,14 +55,13 @@ func (n *Node) Start() {
 		n.tick = n.tickElection
 	}
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	n.electionTicketTimeout = r.Intn(100) + 1
+	n.electionTicketTimeout = r.Intn(50) + 1
 	n.electionTicket = 10
 	n.term = 0
-	//不能阻塞
 	n.tickc = make(chan struct{}, 100)
-	//需要阻塞
 	n.recvc = make(chan *proto.RaftMessage)
 	n.advancec = make(chan *proto.RaftMessage)
+	n.tracker = newProgressTracker()
 
 	go func(node *Node) {
 		for {
@@ -74,9 +75,8 @@ func (n *Node) Start() {
 			}
 		}
 	}(n)
-	//尽量保证计时器精准
 	go func(node *Node) {
-		ticker := time.NewTicker(50 * time.Millisecond)
+		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
@@ -92,8 +92,7 @@ func (n *Node) Ticket() {
 }
 
 func (n *Node) Campaign() {
-	n.lock.Lock()
-	defer n.lock.Unlock()
+
 	if n.state == proto.RaftState_Leader || n.state == proto.RaftState_Watcher || len(n.vote) > 0 {
 		return
 	}
@@ -134,8 +133,7 @@ func (n *Node) IsLeader() bool {
 }
 
 func (n *Node) becameLeader() {
-	n.lock.Lock()
-	defer n.lock.Unlock()
+
 	if n.state == proto.RaftState_Watcher {
 		return
 	}
@@ -144,9 +142,21 @@ func (n *Node) becameLeader() {
 	n.electionTicket = 0
 }
 
+func (r *Node) becomeCandidate() {
+	if r.state == proto.RaftState_Leader || r.state == proto.RaftState_Watcher {
+		return
+	}
+	r.step = CandidateStep
+	r.reset(r.term + 1)
+	r.tick = r.tickElection
+	r.vote = r.ip
+	r.state = proto.RaftState_Candidate
+	r.leader = None
+
+}
+
 func (n *Node) becameFollower(term uint64, leader string) {
-	n.lock.Lock()
-	defer n.lock.Unlock()
+
 	if n.state == proto.RaftState_Watcher {
 		return
 	}
@@ -180,7 +190,7 @@ func FollowerStep(r *Node, m *proto.RaftMessage) {
 		}
 	case proto.MessageType_MsgUpRsp:
 		if updateSelf(r, m.Peers) && r.state == proto.RaftState_Leader {
-			r.becameFollower(r.term, "")
+			r.becameFollower(r.term, None)
 		}
 	case proto.MessageType_MsgHeartbeat:
 		if m.From == r.ip {
@@ -198,7 +208,17 @@ func FollowerStep(r *Node, m *proto.RaftMessage) {
 		_ = updateSelf(r, m.Peers)
 	case proto.MessageType_MsgVote:
 		if canVote(r, m) {
-
+			r.send([]*proto.RaftMessage{
+				{
+					MessageType: proto.MessageType_MsgVoteRsp,
+					From:        r.ip,
+					To:          m.From,
+					Term:        r.term,
+					Peers:       r.peers,
+				},
+			})
+			r.electionTicket = 0
+			r.vote = m.From
 		}
 	}
 }
@@ -216,8 +236,6 @@ func updateSelf(r *Node, from []*proto.Peer) bool {
 	if len(from) == 1 && from[0].Ip == r.ip {
 		return false
 	}
-	r.lock.Lock()
-	defer r.lock.Unlock()
 	temp := make([]*proto.Peer, 0)
 t:
 	for _, fp := range from {
@@ -243,15 +261,12 @@ func directUpdateSelf(r *Node, self []*proto.Peer) {
 	if len(self) == 0 {
 		return
 	}
-	r.lock.Lock()
-	defer r.lock.Unlock()
 	r.peers = append(r.peers, self...)
 
 }
 
 func (n *Node) reset(term uint64) {
-	n.lock.Lock()
-	defer n.lock.Unlock()
+
 	n.term = term
 }
 
@@ -283,7 +298,7 @@ t2:
 	}
 	if (len(selfMiss) == 1 && selfMiss[0].Ip != m.From) ||
 		len(selfMiss) > 1 {
-		r.becameFollower(r.term, "")
+		r.becameFollower(r.term, None)
 	}
 	return selfMiss, fromMiss
 }
@@ -291,23 +306,114 @@ t2:
 func LeaderStep(r *Node, m *proto.RaftMessage) {
 	switch m.MessageType {
 	case proto.MessageType_MsgUp:
+		if m.From == r.ip {
+			return
+		}
+		self, from := updatePeer(r, m)
+		directUpdateSelf(r, self)
+		if len(from) > 0 {
+			r.send([]*proto.RaftMessage{
+				{
+					MessageType: proto.MessageType_MsgUpRsp,
+					From:        r.ip,
+					To:          m.From,
+					Term:        r.term,
+					Peers:       r.peers,
+				},
+			})
+		}
 	case proto.MessageType_MsgUpRsp:
-	case proto.MessageType_MsgHeartbeat:
+		if updateSelf(r, m.Peers) && r.state == proto.RaftState_Leader {
+			r.becameFollower(r.term, None)
+		}
 	case proto.MessageType_MsgVote:
+		if canVote(r, m) {
+			r.send([]*proto.RaftMessage{
+				{
+					MessageType: proto.MessageType_MsgVoteRsp,
+					From:        r.ip,
+					To:          m.From,
+					Term:        r.term,
+					Peers:       r.peers,
+				},
+			})
+			r.electionTicket = 0
+			r.vote = m.From
+		}
+	case proto.MessageType_MsgHeartbeatRsp:
+		for _, one := range r.peers {
+			if one.Ip == m.From {
+				one.Active = true
+			}
+		}
 	}
 }
 
 func CandidateStep(r *Node, m *proto.RaftMessage) {
 	switch m.MessageType {
 	case proto.MessageType_MsgUp:
+		if m.From == r.ip {
+			return
+		}
+		self, from := updatePeer(r, m)
+		directUpdateSelf(r, self)
+		if len(from) > 0 {
+			r.send([]*proto.RaftMessage{
+				{
+					MessageType: proto.MessageType_MsgUpRsp,
+					From:        r.ip,
+					To:          m.From,
+					Term:        r.term,
+					Peers:       r.peers,
+				},
+			})
+		}
 	case proto.MessageType_MsgUpRsp:
+		if updateSelf(r, m.Peers) && r.state == proto.RaftState_Leader {
+			r.becameFollower(r.term, None)
+		}
 	case proto.MessageType_MsgHeartbeat:
+		if m.From == r.ip {
+			return
+		}
+		r.send([]*proto.RaftMessage{
+			{
+				MessageType: proto.MessageType_MsgHeartbeatRsp,
+				From:        r.ip,
+				To:          m.From,
+				Term:        r.term,
+				Peers:       r.peers,
+			},
+		})
+		r.becameFollower(r.term, m.From)
+		_ = updateSelf(r, m.Peers)
 	case proto.MessageType_MsgVote:
+		if canVote(r, m) {
+			r.send([]*proto.RaftMessage{
+				{
+					MessageType: proto.MessageType_MsgVoteRsp,
+					From:        r.ip,
+					To:          m.From,
+					Term:        r.term,
+					Peers:       r.peers,
+				},
+			})
+			r.electionTicket = 0
+			r.vote = m.From
+		}
+	case proto.MessageType_MsgVoteRsp:
+		r.tracker.recodeVote(m.From, m.Reject)
+		result := r.tracker.result(r.peers)
+		if result == VoteWon {
+			r.becameLeader()
+		} else if result == VoteLost {
+			r.becameFollower(r.term, None)
+		}
 	}
 }
 
 func WatcherStep(r *Node, m *proto.RaftMessage) {
-
+	return
 }
 
 func (n *Node) tickElection() {
