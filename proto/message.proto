@@ -9,6 +9,7 @@ enum MessageType {
   MsgHeartbeatRsp = 3;
   MsgVote = 4;
   MsgVoteRsp = 5;
+  MsgHub = 6;
 }
 
 message RaftMessage {

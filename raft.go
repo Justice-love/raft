@@ -33,6 +33,9 @@ type Node struct {
 	electionTicket        int
 	electionTicketTimeout int
 
+	heartbeat        int
+	heartbeatTimeout int
+
 	tickc    chan struct{}
 	recvc    chan *proto.RaftMessage
 	advancec chan *proto.RaftMessage
@@ -62,6 +65,7 @@ func (n *Node) Start() {
 	n.recvc = make(chan *proto.RaftMessage)
 	n.advancec = make(chan *proto.RaftMessage)
 	n.tracker = newProgressTracker()
+	n.heartbeatTimeout = 25
 
 	go func(node *Node) {
 		for {
@@ -119,7 +123,16 @@ func (n *Node) Step(message *proto.RaftMessage) {
 	if message.Term > n.term && message.MessageType != proto.MessageType_MsgVote {
 		n.becameFollower(message.Term, message.From)
 	}
-	n.step(n, message)
+
+	switch message.MessageType {
+	case proto.MessageType_MsgHub:
+		if n.state != proto.RaftState_Leader {
+			n.campaign()
+		}
+	default:
+		n.step(n, message)
+
+	}
 }
 
 func (n *Node) Receive() chan<- *proto.RaftMessage {
@@ -346,6 +359,15 @@ func LeaderStep(r *Node, m *proto.RaftMessage) {
 				one.Active = true
 			}
 		}
+	case proto.MessageType_MsgHeartbeat:
+		r.send([]*proto.RaftMessage{
+			{
+				MessageType: proto.MessageType_MsgHeartbeat,
+				From:        r.ip,
+				Term:        r.term,
+				Peers:       r.peers,
+			},
+		})
 	}
 }
 
@@ -416,10 +438,54 @@ func WatcherStep(r *Node, m *proto.RaftMessage) {
 	return
 }
 
+func (n *Node) pastElectionTimeout() bool {
+	return n.electionTicket >= n.electionTicketTimeout
+}
+
 func (n *Node) tickElection() {
+	n.electionTicket++
+
+	if n.promotable() && n.pastElectionTimeout() {
+		n.electionTicket = 0
+		n.Step(&proto.RaftMessage{
+			MessageType: proto.MessageType_MsgHub,
+			From:        n.ip,
+			Term:        n.term,
+			Peers:       n.peers,
+		})
+	}
+}
+
+func (n *Node) promotable() bool {
+	return n.state != proto.RaftState_Leader
 }
 
 func (n *Node) tickHeartbeat() {
+	if n.state != proto.RaftState_Leader {
+		return
+	}
+	if n.heartbeat >= n.heartbeatTimeout {
+		n.heartbeat = 0
+		n.Step(&proto.RaftMessage{
+			MessageType: proto.MessageType_MsgHeartbeat,
+			From:        n.ip,
+			Term:        n.term,
+			Peers:       n.peers,
+		})
+	}
+}
+
+func (n *Node) campaign() {
+	if !n.promotable() {
+		return
+	}
+	n.becomeCandidate()
+	n.send([]*proto.RaftMessage{{
+		MessageType: proto.MessageType_MsgVote,
+		From:        n.ip,
+		Term:        n.term,
+		Peers:       n.peers,
+	}})
 }
 
 func (n *Node) send(messages []*proto.RaftMessage) {
