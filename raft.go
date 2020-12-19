@@ -489,5 +489,11 @@ func (n *Node) campaign() {
 }
 
 func (n *Node) send(messages []*proto.RaftMessage) {
-
+	for _, one := range messages {
+		if one.To == None {
+			sendAll(one)
+		} else {
+			sendOne(one, one.To)
+		}
+	}
 }
